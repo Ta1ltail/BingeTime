@@ -7,7 +7,7 @@ import { supabase } from './supabase'
 export const movieKey   = (tmdbId) => `m:${tmdbId}`
 export const episodeKey = (tmdbId, season, episode) => `t:${tmdbId}:${season}:${episode}`
 
-const MOVIE_SENTINEL = -1
+export const MOVIE_SENTINEL = -1
 
 export const progressRowToKeyed = (row) => {
   if (row.media_type === 'movie') {
@@ -38,6 +38,35 @@ export const buildEpisodeProgressRow = (user, { tmdbId, season, episode, showTit
   title: showTitle ?? '',
 })
 
+// Map a full client row (string `key` form or numeric sentinel form) to the
+// exact DB column set. Used before every upsert — PostgREST rejects any
+// payload field that isn't a real table column (PGRST204 → HTTP 400).
+export const toDbRow = (row) => {
+  const isTv = row.media_type === 'tv'
+  const season = isTv
+    ? Number(row.season_number)
+    : (typeof row.season_number === 'number' ? row.season_number : MOVIE_SENTINEL)
+  const episode = isTv
+    ? Number(row.episode_number)
+    : (typeof row.episode_number === 'number' ? row.episode_number : MOVIE_SENTINEL)
+  return {
+    user_id: row.user_id,
+    media_type: isTv ? 'tv' : 'movie',
+    tmdb_id: Number(row.tmdb_id),
+    season_number: season,
+    episode_number: episode,
+    // TV rows must carry their own id (DB CHECK: show_id_matches).
+    show_tmdb_id: isTv ? Number(row.show_tmdb_id ?? row.tmdb_id) : null,
+    title: row.title ?? '',
+    poster_path: row.poster_path ?? null,
+    position_seconds: row.position_seconds ?? 0,
+    duration_seconds: row.duration_seconds ?? null,
+    progress_percent: row.progress_percent ?? 0,
+    watched: Boolean(row.watched),
+    // Never send the client-only `key` field (nor stale id/created_at) to PostgREST.
+  }
+}
+
 // ── Fetch helpers (all RLS-scoped to the signed-in user) ────────────────────
 export const fetchAllProgress = async () => {
   const { data, error } = await supabase
@@ -62,7 +91,7 @@ export const fetchLists = async () => {
 export const upsertProgress = async (row) => {
   const { error } = await supabase
     .from('watch_progress')
-    .upsert(row, {
+    .upsert(toDbRow(row), {
       onConflict: 'user_id,media_type,tmdb_id,season_number,episode_number',
     })
   if (error) throw error

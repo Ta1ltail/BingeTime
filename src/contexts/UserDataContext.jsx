@@ -4,6 +4,7 @@ import {
   fetchAllProgress, fetchLists,
   upsertProgress, addToList, removeFromList,
   importGuestData, readGuestProgress, writeGuestProgress,
+  MOVIE_SENTINEL,
 } from '../lib/userData'
 
 /* eslint-disable react-refresh/only-export-components */
@@ -112,9 +113,11 @@ export const UserDataProvider = ({ children }) => {
     return () => clearTimeout(t)
   }, [user, authReady])
 
-  // ── Progress writer (batched, deduped, retried) ───────────────────────────
+  // ── Progress writer (batched, deduped, retried with a hard cap) ───────────
   const inflightRef = useRef(new Map())   // key → promise currently on the wire
   const pendingRef  = useRef(new Map())   // key → newest row payload to write
+  const attemptsRef = useRef(new Map())   // key → failed flush attempts
+  const MAX_FLUSH_ATTEMPTS = 5
 
   const flushKey = useCallback(async (key) => {
     if (inflightRef.current.has(key)) return           // already writing; newest payload stays queued
@@ -122,8 +125,30 @@ export const UserDataProvider = ({ children }) => {
     if (!row) return
     pendingRef.current.delete(key)
     const promise = upsertProgress(row)
-      .catch(() => {
-        // Network/permission failure: queue the newest payload for retry.
+      .then(() => { attemptsRef.current.delete(key) })
+      .catch((err) => {
+        const code = String(err?.code ?? '')
+        // Permanent failures (bad payload PGRST*, RLS 42501, schema 42xxx,
+        // constraint 235xx…) can never succeed by retrying. Retrying them
+        // forever is what spammed thousands of 400s — drop them instead.
+        if (code.startsWith('PGRST') || /^[0-9]{5}$/.test(code)) {
+          attemptsRef.current.delete(key)
+          if (import.meta.env.DEV) {
+            console.warn('[userdata] dropped non-retryable write:', err?.message, key)
+          }
+          return
+        }
+        // Transient failure: re-queue the newest payload, but only up to a cap
+        // so a dead connection can never produce an infinite retry loop.
+        const attempts = (attemptsRef.current.get(key) ?? 0) + 1
+        attemptsRef.current.set(key, attempts)
+        if (attempts >= MAX_FLUSH_ATTEMPTS) {
+          attemptsRef.current.delete(key)
+          if (import.meta.env.DEV) {
+            console.warn('[userdata] gave up after retries:', key)
+          }
+          return
+        }
         setDbError(true)
         const newest = pendingRef.current.get(key) ?? row
         pendingRef.current.set(key, newest)
@@ -174,12 +199,21 @@ export const UserDataProvider = ({ children }) => {
       return
     }
     const prev = progressByKey.get(key) ?? {}
+    const parsed = parseKey(key)
+    // Numeric sentinels for movies (NOT NULL in the DB — never null).
+    const season_number = partial.season_number ?? prev.season_number ?? parsed.season_number
+    const episode_number = partial.episode_number ?? prev.episode_number ?? parsed.episode_number
     const merged = {
       ...prev,
       ...partial,
-      ...parseKey(key),
       user_id: u.id,
       key,
+      media_type: parsed.media_type,
+      tmdb_id: Number(parsed.tmdb_id),
+      // Movies must carry the -1 sentinel; never null/undefined.
+      season_number: season_number ?? (parsed.media_type === 'movie' ? MOVIE_SENTINEL : season_number),
+      episode_number: episode_number ?? (parsed.media_type === 'movie' ? MOVIE_SENTINEL : episode_number),
+      show_tmdb_id: parsed.media_type === 'tv' ? Number(parsed.tmdb_id) : null,
       poster_path: partial.poster_path ?? prev.poster_path ?? null,
       updated_at: new Date().toISOString(),
       // normalize for the DB writer
@@ -265,6 +299,8 @@ export const UserDataProvider = ({ children }) => {
         tmdb_id: parsed.tmdb_id,
         season_number: parsed.season_number,
         episode_number: parsed.episode_number,
+        // TV rows must reference their parent show (show_id_matches CHECK).
+        show_tmdb_id: parsed.media_type === 'tv' ? parsed.tmdb_id : null,
         title: r.title ?? '',
         position_seconds: r.position_seconds ?? 0,
         duration_seconds: r.duration_seconds ?? null,

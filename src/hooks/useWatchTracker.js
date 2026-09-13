@@ -72,6 +72,14 @@ const useWatchTracker = ({
     })
   }, [saveProgress, key, mediaType, tmdbId, season, episode, title, computePercent])
 
+  // persist is recreated whenever saveProgress identity changes; effects below
+  // must NOT depend on it — doing so re-fires persist on every state update
+  // (an infinite persist→setState→persist loop that also starves React
+  // Router's transition-based route renders: URL changes, page never swaps).
+  // A ref keeps the effects stable while always calling the latest closure.
+  const persistRef = useRef(persist)
+  useEffect(() => { persistRef.current = persist }, [persist])
+
   // ── 1s clock: accumulate wall-clock play time, checkpoint every 20s ───────
   useEffect(() => {
     if (!enabled) return undefined
@@ -90,19 +98,19 @@ const useWatchTracker = ({
         accumRef.current += (now - lastTickRef.current) / 1000
         if (accumRef.current >= CHECKPOINT_INTERVAL) {
           accumRef.current = 0
-          persist()
+          persistRef.current()
         }
       }
       lastTickRef.current = now
     }
     const t = setInterval(tick, 1000)
-    const onVisibility = () => { if (document.visibilityState === 'hidden') persist() }
+    const onVisibility = () => { if (document.visibilityState === 'hidden') persistRef.current() }
     document.addEventListener('visibilitychange', onVisibility)
     return () => {
       clearInterval(t)
       document.removeEventListener('visibilitychange', onVisibility)
     }
-  }, [enabled, persist])
+  }, [enabled])
 
   // ── flush immediately when the tracked item changes or unmounts ───────────
   const keyRef = useRef(key)
@@ -112,21 +120,24 @@ const useWatchTracker = ({
     if (prevKey !== key) {
       accumRef.current = 0
       lastTickRef.current = null
-      persist() // final save for the previous item happens via the old key closure
+      // persistRef already points at the newest render's closure (synced
+      // above), so this saves under the NEW key — the row that matters
+      // for resume. Identity-free deps: never re-fires on state updates.
+      persistRef.current()
     }
-  }, [key, persist])
-  // (persist for the OLD key ran inside the previous render's closure before
-  // the key changed; the call above re-saves under the NEW key, which is the
-  // row that matters for resume.)
+  }, [key])
 
+  // Flush on page leave (and once when the tracker unmounts).
+  const enabledRef = useRef(enabled)
+  useEffect(() => { enabledRef.current = enabled }, [enabled])
   useEffect(() => {
-    const onLeave = () => { if (enabled) persist() }
+    const onLeave = () => { if (enabledRef.current) persistRef.current() }
     window.addEventListener('pagehide', onLeave)
     return () => {
       window.removeEventListener('pagehide', onLeave)
-      if (enabled) persist()
+      if (enabledRef.current) persistRef.current()
     }
-  }, [enabled, persist])
+  }, [])
 
   // Playing state: cross-origin embeds can't report play/pause, so the
   // tracker treats "enabled" (player open & tab visible) as playing.
@@ -134,9 +145,9 @@ const useWatchTracker = ({
     playingRef.current = Boolean(enabled)
     if (!enabled) {
       lastTickRef.current = null
-      persist()
+      persistRef.current()
     }
-  }, [enabled, persist])
+  }, [enabled])
 
   const setDuration = useCallback((seconds) => {
     if (!seconds || seconds <= 0) return
