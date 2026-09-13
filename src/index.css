@@ -840,12 +840,18 @@
 @keyframes skeleton-shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
 
 /* ─── API key banner ──────────────────────────────────────────────────────── */
+/* Fixed at the very top, so when it renders (missing/invalid TMDB key) it sits
+   directly over the sticky navbar. It is informational only — no interactive
+   elements — so it must never intercept clicks: without pointer-events:none
+   every navbar link click lands on the banner and navigation "stops working"
+   on every page of the site. */
 .api-banner {
   position: fixed; top: 0; left: 0; right: 0; z-index: 9999;
   background: rgba(248,113,113,0.15); border-bottom: 1px solid rgba(248,113,113,0.4);
   color: #f87171; font-size: 0.9rem; padding: 0.6rem 1.5rem;
   display: flex; align-items: center; gap: 0.5rem;
   backdrop-filter: blur(8px);
+  pointer-events: none;
   p { margin: 0; }
 }
 
